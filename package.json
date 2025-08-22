@@ -1,0 +1,17 @@
+{
+  "name": "w3-sepolia-faucet",
+  "private": true,
+  "packageManager": "pnpm@9.6.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev:api": "pnpm -C apps/api dev",
+    "dev:worker": "pnpm -C apps/worker dev",
+    "dev:frontend": "pnpm -C apps/frontend dev",
+    "db:migrate": "psql \"$DATABASE_URL\" -f sql/001_init.sql"
+  }
+}
