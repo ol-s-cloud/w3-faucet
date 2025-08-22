@@ -1,0 +1,17 @@
+# dependencies & builds
+node_modules
+dist
+.next
+
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# logs & misc
+npm-debug.log*
+pnpm-debug.log*
+.DS_Store
+
+# package manager lock (optional for workspaces)
+pnpm-lock.yaml
