@@ -1,4 +1,4 @@
--- Add 'broadcast' status so we don't miscount timeouts as failures
+-- Add 'broadcast' status (queued, broadcast, sent, failed)
 ALTER TABLE requests
   DROP CONSTRAINT IF EXISTS requests_status_check;
 
