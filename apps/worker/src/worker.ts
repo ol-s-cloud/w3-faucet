@@ -5,32 +5,26 @@ import { query } from "@w3/shared/db";
 import type { DripJob } from "@w3/shared/types";
 import { requireEnv, getIntEnv, getNumberEnv } from "@w3/shared/env";
 import { redis } from "@w3/shared/redis";
-import { reconcileBroadcasts } from "./reconciler";
+import { reconcileBroadcastsWithLock } from "./reconciler";
 
-/* ──────────────────────────────────────────
- * Env
- * ────────────────────────────────────────── */
+/* ── Env ───────────────────────────────────────────────────────────── */
 const RPC                 = requireEnv("SEPOLIA_RPC_URL");
 const KEY                 = requireEnv("FAUCET_PRIVATE_KEY");
 const CHAIN_ID            = getIntEnv("CHAIN_ID", 11155111);
 const DRIP_AMOUNT         = process.env.DRIP_AMOUNT_ETH || "0.02";
 const QUEUE_NAME          = process.env.QUEUE_NAME || "drips";
-requireEnv("REDIS_URL"); // validated by shared/redis
+requireEnv("REDIS_URL");
 
-const TX_WAIT_TIMEOUT_MS  = getIntEnv("TX_WAIT_TIMEOUT_MS", 120_000); // 2 min
+const TX_WAIT_TIMEOUT_MS  = getIntEnv("TX_WAIT_TIMEOUT_MS", 120_000);
 const FALLBACK_GAS_LIMIT  = BigInt(process.env.FALLBACK_GAS_LIMIT ?? "21000");
-const MAX_FEE_BUMP_MULT   = getNumberEnv("MAX_FEE_BUMP_MULT", 1.25);  // 25%
+const MAX_FEE_BUMP_MULT   = getNumberEnv("MAX_FEE_BUMP_MULT", 1.25);
 
-/* ──────────────────────────────────────────
- * Chain
- * ────────────────────────────────────────── */
+/* ── Chain ─────────────────────────────────────────────────────────── */
 const provider = new ethers.JsonRpcProvider(RPC, CHAIN_ID);
 const wallet   = new ethers.Wallet(KEY, provider);
 const sender   = wallet.address.toLowerCase();
 
-/* ──────────────────────────────────────────
- * Nonce lock (Redis)
- * ────────────────────────────────────────── */
+/* ── Nonce lock (Redis) ─────────────────────────────────────────────── */
 const lockKey = (s: string) => `nonce-lock:${s}`;
 async function acquireLock(key: string, ttlSec = 15): Promise<boolean> {
   const res = await redis.set(key, "1", "NX", "EX", ttlSec);
@@ -48,11 +42,8 @@ async function acquireLockWithBackoff(key: string, ttlSec = 15): Promise<boolean
 }
 async function releaseLock(key: string) { try { await redis.del(key); } catch {} }
 
-/* ──────────────────────────────────────────
- * Helpers
- * ────────────────────────────────────────── */
+/* ── Helpers ────────────────────────────────────────────────────────── */
 function bumpBig(x: bigint, mult: number): bigint {
-  // scale (e.g., 1.25 => 125) to keep BigInt math
   const m = Math.round(mult * 100);
   return (x * BigInt(m)) / 100n;
 }
@@ -86,15 +77,12 @@ function formatReason(err: any): string {
   return msg.slice(0, 400);
 }
 
-/* ──────────────────────────────────────────
- * Worker
- * ────────────────────────────────────────── */
+/* ── Worker ─────────────────────────────────────────────────────────── */
 export const worker = new Worker<DripJob>(
   QUEUE_NAME,
   async (job) => {
     const { requestId, address } = job.data;
 
-    // Validate address (permanent fail if invalid)
     if (!ethers.isAddress(address)) {
       await query("UPDATE requests SET status='failed', reason=$1 WHERE id=$2", ["invalid recipient address", requestId]);
       return;
@@ -107,32 +95,26 @@ export const worker = new Worker<DripJob>(
     try {
       const amountWei = ethers.parseEther(DRIP_AMOUNT);
 
-      // gasLimit
       let gasLimit: bigint;
       try {
         gasLimit = await retryRpc(() => wallet.estimateGas({ to: address, value: amountWei }));
       } catch { gasLimit = FALLBACK_GAS_LIMIT; }
 
-      // fees & balance check
-      const { maxFeePerGas, gasPrice } = await getFeeSuggestion();
-      const effectiveFeePerGas = maxFeePerGas ?? gasPrice; // never null
+      const { maxFeePerGas } = await getFeeSuggestion();
+      const effectiveFeePerGas = maxFeePerGas; // we use EIP-1559; Sepolia supports it
       const feeCost = effectiveFeePerGas * gasLimit;
       await ensureBalanceCovers(amountWei, feeCost);
 
-      // send
       const tx = await retryRpc(() => wallet.sendTransaction({
         to: address,
         value: amountWei,
         gasLimit,
         maxFeePerGas,
-        maxPriorityFeePerGas: undefined, // let provider fill if using legacy gasPrice fallback
-        // NOTE: we prefer EIP-1559; if your RPC is legacy-only, set gasPrice: (gasPrice)
+        maxPriorityFeePerGas: undefined, // optional: set if you also compute it above
       }));
 
-      // mark broadcast BEFORE waiting
       await query("UPDATE requests SET status='broadcast', tx_hash=$1 WHERE id=$2", [tx.hash, requestId]);
 
-      // wait (with timeout). If timeout, leave 'broadcast' so reconciler can finalize.
       try {
         await retryRpc(() => provider.waitForTransaction(tx.hash, 1, TX_WAIT_TIMEOUT_MS));
         await query("UPDATE requests SET status='sent' WHERE id=$1 AND tx_hash=$2", [requestId, tx.hash]);
@@ -142,9 +124,9 @@ export const worker = new Worker<DripJob>(
         const msg = String(e?.message ?? "").toLowerCase();
         if (msg.includes("timeout")) {
           console.warn(`⏱️ wait timeout; leaving as 'broadcast' (tx=${tx.hash})`);
-          return; // do not throw, reconciler will resolve later
+          return; // reconciler will resolve later
         }
-        throw e; // other errors bubble to classification below
+        throw e;
       }
     } catch (err: any) {
       const reason = formatReason(err);
@@ -160,18 +142,17 @@ export const worker = new Worker<DripJob>(
   },
   {
     connection: { url: requireEnv("REDIS_URL") },
-    concurrency: 2,
-    // (optional) remove completed/failed jobs to keep Redis lean:
-    // removeOnComplete: 1000, removeOnFail: 1000
+    concurrency: 2
   }
 );
 
-/* ──────────────────────────────────────────
- * Background reconciliation (every 60s)
- * ────────────────────────────────────────── */
+/* ── Reconciler ticker (no overlap; see reconciler.ts) ─────────────── */
+const RECONCILE_INTERVAL_MS = getIntEnv("RECONCILE_INTERVAL_MS", 60_000);
 setInterval(() => {
-  reconcileBroadcasts().catch((e) => console.error("reconciler error", e?.message || e));
-}, 60_000);
+  reconcileBroadcastsWithLock().catch((e) =>
+    console.error("reconciler run error:", e?.message || e)
+  );
+}, RECONCILE_INTERVAL_MS);
 
 worker.on("completed", (job) => console.log(`Job ${job.id} completed ✅`));
 worker.on("failed",    (job, err) => console.error(`Job ${job?.id} failed ❌ ${err?.message || err}`));
