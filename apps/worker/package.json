@@ -1,0 +1,18 @@
+{
+  "name": "@w3/worker",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/worker.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/worker.js",
+    "dev": "NODE_ENV=development node --watch-dist dist/worker.js || (pnpm build && node dist/worker.js)"
+  },
+  "dependencies": {
+    "@w3/shared": "workspace:*",
+    "bullmq": "^5.7.14",
+    "ethers": "^6.13.2",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": { "typescript": "^5.5.4" }
+}
