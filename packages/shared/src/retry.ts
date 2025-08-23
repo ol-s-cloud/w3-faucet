@@ -56,7 +56,7 @@ export async function retryRpc<T>(
       const failFast =
         status === 400 || status === 401 ||
         code.includes("CALL_EXCEPTION") || code.includes("UNPREDICTABLE_GAS_LIMIT") ||
-        /revert|execution reverted|invalid argument|insufficient funds|bad response/i.test(msg);
+        /revert|execution reverted|invalid argument|invalid address|insufficient funds|bad response/i.test(msg);
 
       if (failFast || attempt >= maxRetries || !isRetryableError(err)) throw err;
 
